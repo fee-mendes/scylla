@@ -15,6 +15,8 @@
 #include "service/raft/raft_address_map.hh"
 #include "gms/inet_address.hh"
 #include "utils/UUID.hh"
+#include "alternator/serialization.hh"
+#include "alternator/executor.hh"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/manual_clock.hh>

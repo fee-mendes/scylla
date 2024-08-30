@@ -38,9 +38,10 @@ namespace functions {
 class as_json_function : public scalar_function {
     std::vector<sstring> _selector_names;
     std::vector<data_type> _selector_types;
+    bool is_alternator;
 public:
-    as_json_function(std::vector<sstring>&& selector_names, std::vector<data_type> selector_types)
-        : _selector_names(std::move(selector_names)), _selector_types(std::move(selector_types)) {
+    as_json_function(std::vector<sstring>&& selector_names, std::vector<data_type> selector_types, bool is_alternator)
+        : _selector_names(std::move(selector_names)), _selector_types(std::move(selector_types)), is_alternator(std::move(is_alternator)) {
     }
 
     virtual bool requires_thread() const override;
@@ -62,11 +63,17 @@ public:
                 encoded_row.write("\\\"", 2);
             }
             encoded_row.write("\": ", 3);
-            sstring row_sstring = to_json_string(*_selector_types[i], parameters[i]);
-            encoded_row.write(row_sstring.c_str(), row_sstring.size());
-        }
-        encoded_row.write("}", 1);
-        return bytes(encoded_row.linearize());
+	    if (is_alternator) {
+               sstring row_sstring = to_json_string(*_selector_types[i], parameters[i], true);
+               encoded_row.write(row_sstring.c_str(), row_sstring.size());
+            } else {
+               sstring row_sstring = to_json_string(*_selector_types[i], parameters[i]);
+	       encoded_row.write(row_sstring.c_str(), row_sstring.size());
+            }
+         }
+
+         encoded_row.write("}", 1);
+         return bytes(encoded_row.linearize());
     }
 
     virtual const function_name& name() const override {

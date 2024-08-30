@@ -47,6 +47,7 @@
 #include "utils/assert.hh"
 #include "utils/result_combinators.hh"
 #include "utils/result_loop.hh"
+#include "alternator/executor.hh"
 #include "replica/database.hh"
 #include "replica/mutation_dump.hh"
 
@@ -1930,7 +1931,8 @@ select_statement::maybe_jsonize_select_clause(std::vector<selection::prepared_se
         for (const auto& prepared_selector : prepared_selectors) {
             args.push_back(std::move(prepared_selector.expr));
         }
-        auto as_json = ::make_shared<functions::as_json_function>(std::move(selector_names), std::move(selector_types));
+	bool is_alternator = alternator::is_alternator_keyspace(schema->ks_name());
+	auto as_json = ::make_shared<functions::as_json_function>(std::move(selector_names), std::move(selector_types), std::move(is_alternator));
         auto as_json_selector = selection::prepared_selector{.expr = expr::function_call{as_json, std::move(args)}, .alias = nullptr};
         prepared_selectors.clear();
         prepared_selectors.push_back(as_json_selector);

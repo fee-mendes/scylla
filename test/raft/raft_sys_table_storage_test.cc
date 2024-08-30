@@ -17,6 +17,8 @@
 #include "cql3/query_processor.hh"
 
 #include "gms/inet_address_serializer.hh"
+#include "alternator/serialization.hh"
+#include "alternator/executor.hh"
 
 namespace raft{
 

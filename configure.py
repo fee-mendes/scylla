@@ -1335,7 +1335,7 @@ scylla_tests_dependencies = scylla_core + alternator + idls + scylla_tests_gener
     'test/lib/key_utils.cc',
 ]
 
-scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_injection.cc', 'utils/exceptions.cc']
+scylla_raft_dependencies = scylla_raft_core + alternator + ['utils/uuid.cc', 'utils/error_injection.cc', 'utils/exceptions.cc']
 
 scylla_tools = ['tools/read_mutation.cc',
                 'tools/scylla-types.cc',
@@ -1489,7 +1489,7 @@ deps['test/boost/linearizing_input_stream_test'] = [
     "test/boost/linearizing_input_stream_test.cc",
     "test/lib/log.cc",
 ]
-deps['test/boost/expr_test'] = ['test/boost/expr_test.cc', 'test/lib/expr_test_utils.cc'] + scylla_core
+deps['test/boost/expr_test'] = ['test/boost/expr_test.cc', 'test/lib/expr_test_utils.cc'] + scylla_core + alternator
 deps['test/boost/rate_limiter_test'] = ['test/boost/rate_limiter_test.cc', 'db/rate_limiter.cc']
 deps['test/boost/exceptions_optimized_test'] = ['test/boost/exceptions_optimized_test.cc', 'utils/exceptions.cc']
 deps['test/boost/exceptions_fallback_test'] = ['test/boost/exceptions_fallback_test.cc', 'utils/exceptions.cc']
@@ -1500,20 +1500,19 @@ deps['test/boost/rust_test'] += ['rust/inc/src/lib.rs']
 
 deps['test/boost/group0_cmd_merge_test'] += ['test/lib/expr_test_utils.cc']
 
-deps['test/raft/replication_test'] = ['test/raft/replication_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/raft_server_test'] = ['test/raft/raft_server_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'direct_failure_detector/failure_detector.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/many_test'] = ['test/raft/many_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
-deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
-deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
+deps['test/raft/replication_test'] = ['test/raft/replication_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + alternator + scylla_core
+deps['test/raft/raft_server_test'] = ['test/raft/raft_server_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + alternator + scylla_core
+deps['test/raft/randomized_nemesis_test'] = ['test/raft/randomized_nemesis_test.cc', 'test/raft/helpers.cc'] + alternator + scylla_core
+deps['test/raft/failure_detector_test'] = ['test/raft/failure_detector_test.cc', 'test/raft/helpers.cc'] + alternator + scylla_core
+deps['test/raft/many_test'] = ['test/raft/many_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + alternator + scylla_core
+deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + alternator + scylla_core
+deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_core + alternator
 deps['test/raft/raft_sys_table_storage_test'] = ['test/raft/raft_sys_table_storage_test.cc'] + \
-    scylla_core + scylla_tests_generic_dependencies
-deps['test/raft/raft_address_map_test'] = ['test/raft/raft_address_map_test.cc'] + scylla_core
+    scylla_core + scylla_tests_generic_dependencies + alternator
+deps['test/raft/raft_address_map_test'] = ['test/raft/raft_address_map_test.cc'] + scylla_core + alternator
 deps['test/raft/discovery_test'] =  ['test/raft/discovery_test.cc',
                                      'test/raft/helpers.cc',
-                                     'test/lib/log.cc',
-                                     'service/raft/discovery.cc'] + scylla_raft_dependencies
+                                     'test/lib/log.cc'] + scylla_core + alternator
 
 wasm_deps = {}
 

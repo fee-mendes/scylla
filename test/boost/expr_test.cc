@@ -24,6 +24,8 @@
 #include "test/lib/test_utils.hh"
 #include "cql3/expr/evaluate.hh"
 #include "cql3/expr/expr-utils.hh"
+#include "alternator/serialization.hh"
+#include "alternator/executor.hh"
 
 using namespace cql3;
 using namespace cql3::expr;
