@@ -33,12 +33,16 @@ static inline bool needs_escaping(const sstring& s) {
 }
 
 
-static sstring quote_json_string(const sstring& value) {
+static sstring quote_json_string(const sstring& value, std::optional<bool> alternator) {
     if (!needs_escaping(value)) {
-        return format("\"{}\"", value);
+        return alternator == true ? format("{{\"S\": \"{}\"}}", value) : format("\"{}\"", value);
     }
     std::ostringstream oss;
     oss << std::hex << std::uppercase << std::setfill('0');
+    if (alternator == true) {
+        // Fun fact, we already know its a string, so just append its type
+        oss << "{{\"S\": ";
+    } 
     oss.put('"');
     for (char c : value) {
         switch (c) {
@@ -373,7 +377,9 @@ template <typename T> static T compose_value(const integer_type_impl<T>& t, byte
 static sstring to_json_string_aux(const map_type_impl& t, bytes_view bv, std::optional<bool> alternator) {
     std::ostringstream out;
 
-    out << '{';
+    if (!(alternator == true)) {
+       out << '{';
+    }
     auto size = read_collection_size(bv);
     for (int i = 0; i < size; ++i) {
         auto kb = read_collection_key(bv);
@@ -384,18 +390,23 @@ static sstring to_json_string_aux(const map_type_impl& t, bytes_view bv, std::op
         }
 
         // Valid keys in JSON map must be quoted strings
-        sstring string_key = to_json_string(*t.get_keys_type(), kb, bool(alternator));
-        bool is_unquoted = string_key.empty() || string_key[0] != '"';
-        if (is_unquoted) {
-            out << '"';
-        }
-        out << string_key;
-        if (is_unquoted) {
-            out << '"';
-        }
+	if (alternator == true) {
+	    auto s = *t.get_keys_type();
+	    sstring string_key = quote_json_string(s.to_string(kb), false);
+	    out << string_key;
+	} else {
+	    sstring string_key = to_json_string(*t.get_keys_type(), kb, false);
+            bool is_unquoted = string_key.empty() || string_key[0] != '"';
+            if (is_unquoted) {
+                out << '"';
+            }
+            out << string_key;
+            if (is_unquoted) {
+                out << '"';
+            }
+	}
         out << ": ";
-	if (bool(alternator)) {
-	    // TODO: Ideally, just deserialize bv earlier, and retrieve the whole key in DDB format instead
+	if (alternator == true) {
             try {
 	        rjson::value v = alternator::deserialize_item(vb);
 	        rapidjson::StringBuffer sb;
@@ -406,10 +417,12 @@ static sstring to_json_string_aux(const map_type_impl& t, bytes_view bv, std::op
 	        std::cout << exc.what();
 	    }
 	} else {
-            out << to_json_string(*t.get_values_type(), vb, bool(alternator));
+            out << to_json_string(*t.get_values_type(), vb, (alternator == true));
 	}
     }
-    out << '}';
+    if (!(alternator == true)) {
+       out << '}';
+    }
     return std::move(out).str();
 }
 
@@ -493,7 +506,7 @@ static sstring to_json_string_aux(const user_type_impl& t, bytes_view bv) {
         if (ti != t.all_types().begin()) {
             out << ", ";
         }
-        out << quote_json_string(t.field_name_as_string(i)) << ": ";
+        out << quote_json_string(t.field_name_as_string(i), false) << ": ";
         if (*vi) {
             //TODO(sarna): We can avoid copying if to_json_string accepted bytes_view
             out << to_json_string(**ti, **vi, false);
@@ -513,7 +526,7 @@ namespace {
 struct to_json_string_visitor {
     bytes_view bv;
     std::optional<bool> alternator;
-    sstring operator()(const reversed_type_impl& t) { return to_json_string(*t.underlying_type(), bv, alternator.value()); }
+    sstring operator()(const reversed_type_impl& t) { return to_json_string(*t.underlying_type(), bv, alternator); }
     template <typename T> sstring operator()(const integer_type_impl<T>& t) { return to_sstring(compose_value(t, bv)); }
     template <typename T> sstring operator()(const floating_type_impl<T>& t) {
         if (bv.empty()) {
@@ -526,37 +539,42 @@ struct to_json_string_visitor {
         }
         return to_sstring(d);
     }
-    sstring operator()(const uuid_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const inet_addr_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const string_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const bytes_type_impl& t) { return quote_json_string("0x" + t.to_string(bv)); }
+    sstring operator()(const uuid_type_impl& t) { return quote_json_string(t.to_string(bv), false); }
+    sstring operator()(const inet_addr_type_impl& t) { return quote_json_string(t.to_string(bv), false); }
+    sstring operator()(const string_type_impl& t) { return quote_json_string(t.to_string(bv), alternator); }
+    sstring operator()(const bytes_type_impl& t) { return quote_json_string("0x" + t.to_string(bv), false); }
     sstring operator()(const boolean_type_impl& t) { return t.to_string(bv); }
-    sstring operator()(const timestamp_date_base_class& t) { return quote_json_string(timestamp_to_json_string(t, bv)); }
-    sstring operator()(const timeuuid_type_impl& t) { return quote_json_string(t.to_string(bv)); }
+    sstring operator()(const timestamp_date_base_class& t) { return quote_json_string(timestamp_to_json_string(t, bv), false); }
+    sstring operator()(const timeuuid_type_impl& t) { return quote_json_string(t.to_string(bv), false); }
     sstring operator()(const map_type_impl& t) { return to_json_string_aux(t, bv, alternator); }
     sstring operator()(const set_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const list_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const tuple_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const user_type_impl& t) { return to_json_string_aux(t, bv); }
-    sstring operator()(const simple_date_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const time_type_impl& t) { return quote_json_string(t.to_string(bv)); }
+    sstring operator()(const simple_date_type_impl& t) { return quote_json_string(t.to_string(bv), false); }
+    sstring operator()(const time_type_impl& t) { return quote_json_string(t.to_string(bv), false); }
     sstring operator()(const empty_type_impl& t) { return "null"; }
     sstring operator()(const duration_type_impl& t) {
         auto v = t.deserialize(bv);
         if (v.is_null()) {
             throw exceptions::invalid_request_exception("Cannot create JSON string - deserialization error");
         }
-        return quote_json_string(t.to_string(bv));
+        return quote_json_string(t.to_string(bv), false);
     }
     sstring operator()(const counter_type_impl& t) {
         // It will be called only from cql3 layer while processing query results.
         return to_json_string(*counter_cell_view::total_value_type(), bv, false);
     }
+
     sstring operator()(const decimal_type_impl& t) {
         if (bv.empty()) {
             throw exceptions::invalid_request_exception("Cannot create JSON string - deserialization error");
         }
         auto v = t.deserialize(bv);
+	if (alternator == true) {
+	    sstring ret = format("{{\"N\": \"{}\"}}", value_cast<big_decimal>(v).to_string());
+	    return ret;
+	}
         return value_cast<big_decimal>(v).to_string();
     }
     sstring operator()(const varint_type_impl& t) {

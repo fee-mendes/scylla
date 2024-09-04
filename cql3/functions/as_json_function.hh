@@ -48,31 +48,37 @@ public:
 
     virtual bytes_opt execute(std::span<const bytes_opt> parameters) override {
         bytes_ostream encoded_row;
+        // The DynamoDB Low Level API
+	if (is_alternator) {
+	    encoded_row.write("{ \"Item\": ", 10);
+	}
         encoded_row.write("{", 1);
         for (size_t i = 0; i < _selector_names.size(); ++i) {
             if (i > 0) {
                 encoded_row.write(", ", 2);
             }
-            bool has_any_upper = boost::algorithm::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
-            encoded_row.write("\"", 1);
-            if (has_any_upper) {
-                encoded_row.write("\\\"", 2);
+            // We don't want to print the :attrs column on Alternator.
+	    if (!(is_alternator) || (!(strcmp(_selector_names[i].c_str(), ":attrs") == 0))) {
+	        bool has_any_upper = boost::algorithm::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
+	        encoded_row.write("\"", 1);
+	        if (has_any_upper) {
+	            encoded_row.write("\\\"", 2);
+	        }
+	        encoded_row.write(_selector_names[i].c_str(), _selector_names[i].size());
+	        if (has_any_upper) {
+                    encoded_row.write("\\\"", 2);
+	        }
+	        encoded_row.write("\": ", 3);
             }
-            encoded_row.write(_selector_names[i].c_str(), _selector_names[i].size());
-            if (has_any_upper) {
-                encoded_row.write("\\\"", 2);
-            }
-            encoded_row.write("\": ", 3);
-	    if (is_alternator) {
-               sstring row_sstring = to_json_string(*_selector_types[i], parameters[i], true);
-               encoded_row.write(row_sstring.c_str(), row_sstring.size());
-            } else {
-               sstring row_sstring = to_json_string(*_selector_types[i], parameters[i]);
+               sstring row_sstring = to_json_string(*_selector_types[i], parameters[i], is_alternator);
 	       encoded_row.write(row_sstring.c_str(), row_sstring.size());
-            }
          }
 
          encoded_row.write("}", 1);
+	 if (is_alternator) {
+	    encoded_row.write("}", 1);
+	 }
+
          return bytes(encoded_row.linearize());
     }
 
