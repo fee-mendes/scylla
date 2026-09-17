@@ -1860,6 +1860,42 @@ rest_quiesce_topology(sharded<service::storage_service>& ss, std::unique_ptr<htt
 
 static
 future<json::json_return_type>
+rest_cluster_freeze(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    int64_t timeout = 0;
+    if (auto s = req->get_query_param("timeout"); !s.empty()) {
+        try {
+            timeout = boost::lexical_cast<int64_t>(s);
+        } catch (boost::bad_lexical_cast&) {
+            throw httpd::bad_param_exception(fmt::format("timeout must be an integer, got {}", s));
+        }
+    }
+    try {
+        co_await ss.local().freeze_cluster(std::chrono::seconds(timeout));
+    } catch (std::invalid_argument& e) {
+        throw httpd::bad_param_exception(e.what());
+    }
+    co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_get_cluster_freeze_state(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    auto state = co_await ss.local().get_cluster_freeze_state();
+    co_return service::cluster_freeze_state_to_string(state);
+}
+
+static
+future<json::json_return_type>
+rest_cluster_unfreeze(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    auto result = co_await ss.local().unfreeze_cluster();
+    ss::cluster_unfreeze_result res;
+    res.previous_state = service::cluster_freeze_state_to_string(result.previous_state);
+    res.group0_log_advanced = result.group0_log_advanced;
+    co_return res;
+}
+
+static
+future<json::json_return_type>
 rest_get_schema_versions(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         return ss.local().describe_schema_versions().then([] (auto result) {
             std::vector<sp::mapper_list> res;
@@ -2033,6 +2069,9 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
     ss::set_vnode_tablet_migration_node_storage_mode.set(r, gated(ss, rest_bind(rest_set_vnode_tablet_migration_node_storage_mode, ctx, ss)));
     ss::finalize_vnode_tablet_migration.set(r, gated(ss, rest_bind(rest_finalize_vnode_tablet_migration, ctx, ss)));
     ss::quiesce_topology.set(r, gated(ss, rest_bind(rest_quiesce_topology, ss)));
+    ss::cluster_freeze.set(r, gated(ss, rest_bind(rest_cluster_freeze, ss)));
+    ss::get_cluster_freeze_state.set(r, gated(ss, rest_bind(rest_get_cluster_freeze_state, ss)));
+    ss::cluster_unfreeze.set(r, gated(ss, rest_bind(rest_cluster_unfreeze, ss)));
     sp::get_schema_versions.set(r, gated(ss, rest_bind(rest_get_schema_versions, ss)));
     ss::drop_quarantined_sstables.set(r, gated(ss, rest_bind(rest_drop_quarantined_sstables, ctx, ss)));
 }
@@ -2114,6 +2153,9 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::set_vnode_tablet_migration_node_storage_mode.unset(r);
     ss::finalize_vnode_tablet_migration.unset(r);
     ss::quiesce_topology.unset(r);
+    ss::cluster_freeze.unset(r);
+    ss::get_cluster_freeze_state.unset(r);
+    ss::cluster_unfreeze.unset(r);
     sp::get_schema_versions.unset(r);
     ss::drop_quarantined_sstables.unset(r);
 }

@@ -3387,6 +3387,57 @@
          ]
       },
       {
+         "path":"/storage_service/cluster_freeze",
+         "operations":[
+            {
+               "nickname":"cluster_freeze",
+               "method":"POST",
+               "summary":"Freezes the cluster: waits for in-progress topology operations to finish, then rejects all changes to schema, topology, authentication, service levels and other group 0 state, and stops background operations which change it (e.g. tablet load balancing). Meant for taking disk snapshots of all nodes which can be restored together. Fails, leaving the cluster not frozen, if any node is down or if the timeout is reached. No-op if the cluster is already frozen.",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"timeout",
+                     "description":"Timeout in seconds for the cluster to become frozen. 0 (the default) means no timeout; otherwise it must be at least 300.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"long",
+                     "paramType":"query"
+                  }
+               ]
+            },
+            {
+               "nickname":"get_cluster_freeze_state",
+               "method":"GET",
+               "summary":"Returns the cluster freeze state: none, freezing or frozen",
+               "type":"string",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/cluster_unfreeze",
+         "operations":[
+            {
+               "nickname":"cluster_unfreeze",
+               "method":"POST",
+               "summary":"Unfreezes the cluster, or aborts a freeze in progress. No-op if the cluster is not frozen.",
+               "type":"cluster_unfreeze_result",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/metrics/total_hints",
          "operations":[
             {
@@ -3699,6 +3750,20 @@
       }
    ],
    "models":{
+      "cluster_unfreeze_result":{
+         "id":"cluster_unfreeze_result",
+         "description":"Result of unfreezing the cluster",
+         "properties":{
+            "previous_state":{
+               "type":"string",
+               "description":"The freeze state before unfreezing: none, freezing or frozen"
+            },
+            "group0_log_advanced":{
+               "type":"boolean",
+               "description":"True if the group 0 log may have advanced while the cluster was frozen (or the freeze did not complete). Disk snapshots taken during the freeze are then not guaranteed to be restorable together."
+            }
+         }
+      },
       "mapper":{
          "id":"mapper",
          "description":"A key value mapping",
