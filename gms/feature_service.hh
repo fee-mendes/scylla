@@ -188,6 +188,7 @@ public:
     gms::feature keyspace_multi_rf_change { *this, "KEYSPACE_MULTI_RF_CHANGE"sv };
     gms::feature view_building_tasks_min_task_id { *this, "VIEW_BUILDING_TASKS_MIN_TASK_ID"sv };
     gms::feature quiesce_topology_enhanced { *this, "QUIESCE_TOPOLOGY_ENHANCED"sv };
+    gms::feature cluster_freeze { *this, "CLUSTER_FREEZE"sv };
     gms::feature tablet_pow2_convergence { *this, "TABLET_POW2_CONVERGENCE"sv };
     gms::feature fetch_column_mappings_on_tablet_migration { *this, "FETCH_COLUMN_MAPPINGS_ON_TABLET_MIGRATION"sv };
     // Gates the repair_get_table_size RPC verb used to auto-detect small user

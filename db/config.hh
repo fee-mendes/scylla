@@ -357,6 +357,7 @@ public:
     named_value<sstring> maintenance_socket;
     named_value<sstring> maintenance_socket_group;
     named_value<bool> maintenance_mode;
+    named_value<bool> unfreeze_cluster_on_startup;
     named_value<uint16_t> native_transport_port_ssl;
     named_value<uint16_t> native_shard_aware_transport_port;
     named_value<uint16_t> native_shard_aware_transport_port_ssl;

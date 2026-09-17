@@ -128,6 +128,7 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
+#include "cql3/statements/strong_consistency/statement_helpers.hh"
 #include <stdexcept>
 #include <unistd.h>
 #include <variant>
@@ -1475,6 +1476,21 @@ future<> storage_service::update_topology_with_local_metadata(raft::server& raft
             break;
         }
 
+        if (auto freeze_state = _topology_state_machine._topology.freeze_state; freeze_state != cluster_freeze_state::none) {
+            if (!_db.local().get_config().unfreeze_cluster_on_startup()) {
+                throw std::runtime_error(fmt::format(
+                        "The cluster is {} and this node's metadata (shard count, ignore_msb, release version "
+                        "or supported features) differs from the one stored in the topology, which cannot be "
+                        "updated while the cluster is frozen. Start the node with the same configuration and "
+                        "version it had when the cluster was frozen, or unfreeze the cluster first "
+                        "(e.g. with unfreeze_cluster_on_startup)", freeze_state));
+            }
+            rtlogger.info("update topology with local metadata: waiting for the cluster to be unfrozen");
+            release_guard(std::move(guard));
+            co_await _group0->client().wait_until_not_frozen(_group0_as);
+            continue;
+        }
+
         // It might happen that, in the previous run, the node commits a command
         // that adds support for a feature, crashes before applying it and now
         // it is not safe to disable support for it. If there is an attempt to
@@ -1732,6 +1748,10 @@ future<> storage_service::join_topology(sharded<service::storage_proxy>& proxy,
             co_await await_tablets_rebuilt(raft_replace_info->raft_id);
         }
     }
+
+    // Started in the background: unfreezing requires a group 0 quorum, which may only be
+    // reached once other nodes of a restored cluster finish booting too.
+    _unfreeze_cluster_on_startup_fiber = maybe_unfreeze_cluster_on_startup();
 
     co_await update_topology_with_local_metadata(raft_server);
 
@@ -2387,7 +2407,8 @@ future<> storage_service::wait_for_group0_stop() {
         _group0_as.request_abort();
         _topology_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
         _view_building_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
-        co_await when_all(std::move(_raft_state_monitor), std::move(_sstable_vnodes_cleanup_fiber), std::move(_upgrade_to_topology_coordinator_fiber));
+        co_await when_all(std::move(_raft_state_monitor), std::move(_sstable_vnodes_cleanup_fiber), std::move(_upgrade_to_topology_coordinator_fiber),
+                std::move(_unfreeze_cluster_on_startup_fiber));
     }
 }
 
@@ -6596,6 +6617,272 @@ future<bool> storage_service::verify_topology_quiesced(token_metadata::version_t
 
     co_await _group0->group0_server().read_barrier(&_group0_as);
     co_return _topology_state_machine._topology.version == expected_version && !_topology_state_machine._topology.is_busy();
+}
+
+future<std::optional<utils::UUID>> storage_service::find_queued_freeze_request() {
+    for (const auto& id : _topology_state_machine._topology.global_requests_queue) {
+        auto entry = co_await _sys_ks.local().get_topology_request_entry_opt(id);
+        if (!entry) {
+            continue;
+        }
+        auto* req = std::get_if<global_topology_request>(&entry->request_type);
+        if (req && *req == global_topology_request::freeze_cluster) {
+            co_return id;
+        }
+    }
+    co_return std::nullopt;
+}
+
+future<> storage_service::freeze_cluster(std::chrono::seconds timeout) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [timeout] (auto& ss) {
+            return ss.freeze_cluster(timeout);
+        });
+    }
+
+    static constexpr auto min_timeout = std::chrono::minutes(5);
+    if (timeout.count() < 0 || (timeout.count() != 0 && timeout < min_timeout)) {
+        throw std::invalid_argument(fmt::format("Cluster freeze timeout must be 0 (no timeout) or at least {} seconds, got {}",
+                std::chrono::duration_cast<std::chrono::seconds>(min_timeout).count(), timeout.count()));
+    }
+    if (!_feature_service.cluster_freeze || !_feature_service.topology_global_request_queue) {
+        throw std::runtime_error("Cluster freeze is not supported until all nodes are upgraded");
+    }
+
+    auto db = _db.local().as_data_dictionary();
+    for (const auto& ks_name : db.get_keyspaces() | std::views::transform([] (auto ks) { return ks.metadata()->name(); })) {
+        if (cql3::statements::strong_consistency::is_strongly_consistent(db, ks_name)) {
+            throw std::runtime_error(fmt::format("Cluster freeze is not supported with strongly consistent keyspaces (keyspace {})", ks_name));
+        }
+    }
+
+    auto dead_nodes = [this] {
+        const auto& topo = _topology_state_machine._topology;
+        std::vector<raft::server_id> dead;
+        for (const auto* nodes : {&topo.normal_nodes, &topo.transition_nodes}) {
+            for (const auto& id : *nodes | std::views::keys) {
+                if (!_gossiper.is_alive(locator::host_id{id.uuid()})) {
+                    dead.push_back(id);
+                }
+            }
+        }
+        return dead;
+    };
+
+    utils::UUID request_id;
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        const auto& topo = _topology_state_machine._topology;
+
+        if (topo.freeze_state == cluster_freeze_state::frozen && !(co_await find_queued_freeze_request())) {
+            rtlogger.info("freeze_cluster: the cluster is already frozen");
+            co_return;
+        }
+        if (topo.freeze_state != cluster_freeze_state::none) {
+            throw std::runtime_error("Cluster freeze is already in progress. "
+                    "Wait for it to complete, or abort it with unfreeze");
+        }
+        if (!topo.ignored_nodes.empty()) {
+            throw std::runtime_error(fmt::format("Cannot freeze the cluster while there are ignored nodes: {}", topo.ignored_nodes));
+        }
+        if (auto dead = dead_nodes(); !dead.empty()) {
+            throw std::runtime_error(fmt::format("Cannot freeze the cluster while nodes are down: {}", dead));
+        }
+
+        request_id = guard.new_group0_state_id();
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.set_cluster_freeze_state(cluster_freeze_state::freezing)
+               .queue_global_topology_request_id(request_id);
+        topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+        rtbuilder.set("done", false)
+                 .set("request_type", global_topology_request::freeze_cluster);
+
+        auto reason = ::format("cluster freeze requested from {}", _group0->group0_server().id());
+        rtlogger.info("{}, timeout={}s, request id {}", reason, timeout.count(), request_id);
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, reason);
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.debug("freeze_cluster: concurrent modification while submitting request, retrying");
+        }
+    }
+
+    // Wait for the topology coordinator to complete the request. Wake up periodically
+    // to check for dead nodes and for the timeout, so that an unhealthy cluster is not
+    // left in the freezing state (which rejects user operations) for long.
+    const auto deadline = timeout.count() == 0
+            ? std::optional<lowres_clock::time_point>()
+            : std::optional(lowres_clock::now() + timeout);
+    static constexpr auto poll_interval = std::chrono::seconds(1);
+    while (true) {
+        auto entry = co_await _sys_ks.local().get_topology_request_entry_opt(request_id);
+        if (!entry) {
+            throw std::runtime_error(fmt::format("Cluster freeze request {} disappeared", request_id));
+        }
+        if (entry->done) {
+            if (!entry->error.empty()) {
+                throw std::runtime_error(fmt::format("Cluster freeze failed: {}", entry->error));
+            }
+            rtlogger.info("freeze_cluster: the cluster is frozen (request id {})", request_id);
+            co_return;
+        }
+
+        std::optional<sstring> abort_reason;
+        if (auto dead = dead_nodes(); !dead.empty()) {
+            abort_reason = fmt::format("nodes are down: {}", dead);
+        } else if (deadline && lowres_clock::now() >= *deadline) {
+            abort_reason = fmt::format("timed out after {} seconds", timeout.count());
+        }
+        if (abort_reason) {
+            co_await abort_cluster_freeze(request_id, *abort_reason);
+            // Loop around: either the abort was committed and the request is done with an error,
+            // or the coordinator completed the freeze first.
+            continue;
+        }
+
+        try {
+            co_await _topology_state_machine.event.wait(lowres_clock::now() + poll_interval);
+        } catch (const condition_variable_timed_out&) {
+        }
+    }
+}
+
+future<> storage_service::abort_cluster_freeze(utils::UUID request_id, sstring reason) {
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{}, cluster_freeze_policy::allow_when_frozen);
+        const auto& topo = _topology_state_machine._topology;
+
+        auto entry = co_await _sys_ks.local().get_topology_request_entry_opt(request_id);
+        if (!entry || entry->done) {
+            co_return;
+        }
+
+        rtlogger.warn("aborting cluster freeze request {}: {}", request_id, reason);
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.set_cluster_freeze_state(cluster_freeze_state::none)
+               .del_cluster_freeze_marker()
+               .drop_global_topology_request_id(topo.global_requests_queue, request_id);
+        topology_request_tracking_mutation_builder rtbuilder(request_id);
+        rtbuilder.done(fmt::format("aborted: {}", reason));
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+                ::format("abort cluster freeze: {}", reason));
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            co_return;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.debug("abort_cluster_freeze: concurrent modification, retrying");
+        }
+    }
+}
+
+future<storage_service::cluster_unfreeze_result> storage_service::unfreeze_cluster() {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [] (auto& ss) {
+            return ss.unfreeze_cluster();
+        });
+    }
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{}, cluster_freeze_policy::allow_when_frozen);
+        const auto& topo = _topology_state_machine._topology;
+
+        cluster_unfreeze_result result{.previous_state = topo.freeze_state};
+        if (topo.freeze_state == cluster_freeze_state::none) {
+            rtlogger.info("unfreeze_cluster: the cluster is not frozen");
+            co_return result;
+        }
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.set_cluster_freeze_state(cluster_freeze_state::none)
+               .del_cluster_freeze_marker();
+        utils::chunked_vector<canonical_mutation> updates;
+
+        auto freeze_request = co_await find_queued_freeze_request();
+        if (freeze_request) {
+            // The freeze did not complete, so it is aborted. Disk snapshots taken during
+            // this time are not guaranteed to be consistent.
+            result.group0_log_advanced = true;
+            builder.drop_global_topology_request_id(topo.global_requests_queue, *freeze_request);
+            updates.push_back(topology_request_tracking_mutation_builder(*freeze_request)
+                    .done("aborted: cluster unfrozen before the freeze completed")
+                    .build());
+        } else {
+            // The freeze completed. The marker holds the group 0 state id and term right after the
+            // freeze. The read barrier done by start_operation() makes sure we see everything committed
+            // so far. Any group 0 command applied since then changes the state id, and a leader
+            // election (which commits a dummy entry) changes the term.
+            const auto current_term = int64_t(_group0->group0_server().get_current_term().value());
+            result.group0_log_advanced = !topo.freeze_group0_state_id || !topo.freeze_group0_term
+                    || *topo.freeze_group0_state_id != guard.observed_group0_state_id()
+                    || *topo.freeze_group0_term != current_term;
+            if (result.group0_log_advanced) {
+                rtlogger.warn("unfreeze_cluster: group 0 log advanced while the cluster was frozen "
+                        "(state id at freeze: {}, now: {}; term at freeze: {}, now: {})",
+                        topo.freeze_group0_state_id, guard.observed_group0_state_id(), topo.freeze_group0_term, current_term);
+            }
+        }
+        updates.push_back(builder.build());
+
+        auto reason = ::format("cluster unfreeze requested from {}", _group0->group0_server().id());
+        rtlogger.info("{} (previous state: {})", reason, topo.freeze_state);
+        topology_change change{std::move(updates)};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, reason);
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            co_return result;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.debug("unfreeze_cluster: concurrent modification, retrying");
+        }
+    }
+}
+
+future<cluster_freeze_state> storage_service::get_cluster_freeze_state() {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [] (auto& ss) {
+            return ss.get_cluster_freeze_state();
+        });
+    }
+
+    co_await _group0->group0_server().read_barrier(&_group0_as);
+    co_return _topology_state_machine._topology.freeze_state;
+}
+
+future<> storage_service::maybe_unfreeze_cluster_on_startup() {
+    if (!_db.local().get_config().unfreeze_cluster_on_startup()) {
+        co_return;
+    }
+    rtlogger.warn("unfreeze_cluster_on_startup is set: the cluster will be unfrozen if it is frozen. "
+            "Remove this option once the cluster is restored, otherwise restarting this node unfreezes the cluster");
+    while (!_group0_as.abort_requested()) {
+        try {
+            auto result = co_await unfreeze_cluster();
+            if (result.previous_state != cluster_freeze_state::none) {
+                rtlogger.warn("unfreeze_cluster_on_startup: the cluster was unfrozen (previous state: {})", result.previous_state);
+            }
+            co_return;
+        } catch (...) {
+            if (_group0_as.abort_requested()) {
+                co_return;
+            }
+            rtlogger.warn("unfreeze_cluster_on_startup: failed to unfreeze the cluster, retrying: {}", std::current_exception());
+        }
+        try {
+            co_await sleep_abortable(std::chrono::seconds(5), _group0_as);
+        } catch (...) {
+            co_return;
+        }
+    }
 }
 
 future<join_node_request_result> storage_service::join_node_request_handler(join_node_request_params params) {

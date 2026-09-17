@@ -227,6 +227,7 @@ private:
     condition_variable _tablet_split_monitor_event;
     utils::sequenced_set<table_id> _tablet_split_candidates;
     future<> _tablet_split_monitor = make_ready_future<>();
+    future<> _unfreeze_cluster_on_startup_fiber = make_ready_future<>();
 
     shared_ptr<node_ops::task_manager_module> _node_ops_module;
     shared_ptr<service::task_manager_module> _tablets_module;
@@ -1016,6 +1017,28 @@ public:
     // Verifies topology is not busy, and also that topology version hasn't changed since the one provided
     // by the caller.
     future<bool> verify_topology_quiesced(token_metadata::version_t expected_version);
+
+    // Cluster freeze, see service/cluster_freeze.hh.
+    //
+    // Blocks until the cluster is frozen. `timeout` of zero means no timeout; otherwise it must be
+    // at least 5 minutes. The freeze is aborted (the cluster goes back to not frozen) if it times out,
+    // if any node is down, or if unfreeze_cluster() is called concurrently.
+    future<> freeze_cluster(std::chrono::seconds timeout);
+    struct cluster_unfreeze_result {
+        // The state the cluster was in before unfreezing.
+        cluster_freeze_state previous_state = cluster_freeze_state::none;
+        // True if the group 0 log may have advanced while the cluster was frozen,
+        // in which case disk snapshots taken during the freeze are not guaranteed to be restorable.
+        bool group0_log_advanced = false;
+    };
+    future<cluster_unfreeze_result> unfreeze_cluster();
+    future<cluster_freeze_state> get_cluster_freeze_state();
+private:
+    future<std::optional<utils::UUID>> find_queued_freeze_request();
+    future<> abort_cluster_freeze(utils::UUID request_id, sstring reason);
+    // If the cluster is frozen and `unfreeze_cluster_on_startup` is set, unfreezes it in the background.
+    future<> maybe_unfreeze_cluster_on_startup();
+public:
 
     // In the maintenance mode, other nodes won't be available thus we disabled joining
     // the token ring and the token metadata won't be populated with the local node's endpoint.
