@@ -678,6 +678,10 @@ future<> storage_service::topology_state_load(state_change_hint hint) {
     _topology_state_machine.reload_count++;
     auto& topology = _topology_state_machine._topology;
 
+    if (_group0) {
+        _group0->client().set_cluster_freeze_state(topology.freeze_state);
+    }
+
     co_await _feature_service.container().invoke_on_all([&] (gms::feature_service& fs) {
         return fs.enable(topology.enabled_features | std::ranges::to<std::set<std::string_view>>());
     });
@@ -1990,6 +1994,7 @@ future<> storage_service::drain_on_shutdown() {
 
 void storage_service::set_group0(raft_group0& group0) {
     _group0 = &group0;
+    _group0->client().set_cluster_freeze_state(_topology_state_machine._topology.freeze_state);
 }
 
 future<> storage_service::init_address_map(gms::gossip_address_map& address_map) {

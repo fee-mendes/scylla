@@ -24,6 +24,7 @@
 #include "gc_clock.hh"
 #include "service/raft/group0_state_machine.hh"
 #include "service/maintenance_mode.hh"
+#include "service/cluster_freeze.hh"
 
 class mutation;
 
@@ -112,6 +113,10 @@ class raft_group0_client {
 
     maintenance_mode_enabled _maintenance_mode;
 
+    // Mirrors topology::freeze_state, updated whenever the topology state is (re)loaded.
+    cluster_freeze_state _cluster_freeze_state = cluster_freeze_state::none;
+    condition_variable _cluster_freeze_state_changed;
+
     template <typename Command>
     void validate_change(const Command& change) {}
     template<typename Command>
@@ -124,7 +129,8 @@ public:
 
     future<> add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
 
-    future<> add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as);
+    future<> add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as,
+            cluster_freeze_policy freeze_policy = cluster_freeze_policy::reject_when_freezing);
 
     // Ensures that all previously finished operations on group 0 are visible on this node;
     // in particular, performs a Raft read barrier on group 0.
@@ -146,7 +152,12 @@ public:
     // FIXME?: this is kind of annoying for the user.
     // we could forward the call to shard 0, have group0_guard keep a foreign_ptr to the internal data structures on shard 0,
     // and add_entry would again forward to shard 0.
-    future<group0_guard> start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt);
+    //
+    // `freeze_policy` decides whether the change committed with this guard is allowed
+    // while the cluster is freezing or frozen (see cluster_freeze.hh). The check is done
+    // in `add_entry`, so read-only operations are never affected by it.
+    future<group0_guard> start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout = std::nullopt,
+            cluster_freeze_policy freeze_policy = cluster_freeze_policy::reject_when_freezing);
 
     template<typename Command>
     requires std::same_as<Command, write_mutations>
@@ -166,6 +177,16 @@ public:
     semaphore& read_apply_mutex();
 
     bool maintenance_mode() const;
+
+    cluster_freeze_state get_cluster_freeze_state() const {
+        return _cluster_freeze_state;
+    }
+    void set_cluster_freeze_state(cluster_freeze_state);
+    // Throws cluster_frozen_exception if a group 0 change is not allowed by the given policy.
+    void check_cluster_freeze(cluster_freeze_policy) const;
+    // Waits until the cluster is neither freezing nor frozen.
+    // Used by background activities which should defer their group 0 changes instead of failing.
+    future<> wait_until_not_frozen(seastar::abort_source&);
 
     static utils::UUID generate_group0_state_id(utils::UUID prev_state_id);
     future<utils::UUID> get_last_group0_state_id();

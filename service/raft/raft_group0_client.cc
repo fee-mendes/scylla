@@ -106,12 +106,16 @@ struct group0_guard::impl {
     utils::UUID _observed_group0_state_id;
     utils::UUID _new_group0_state_id;
 
+    cluster_freeze_policy _freeze_policy;
+
     impl(const impl&) = delete;
     impl& operator=(const impl&) = delete;
 
-    impl(semaphore_units<> operation_mutex_holder, semaphore_units<> read_apply_mutex_holder, utils::UUID observed_group0_state_id, utils::UUID new_group0_state_id)
+    impl(semaphore_units<> operation_mutex_holder, semaphore_units<> read_apply_mutex_holder, utils::UUID observed_group0_state_id, utils::UUID new_group0_state_id,
+            cluster_freeze_policy freeze_policy)
         : _operation_mutex_holder(std::move(operation_mutex_holder)), _read_apply_mutex_holder(std::move(read_apply_mutex_holder))
         , _observed_group0_state_id(observed_group0_state_id), _new_group0_state_id(new_group0_state_id)
+        , _freeze_policy(freeze_policy)
     {}
 
     void release_read_apply_mutex() {
@@ -158,6 +162,40 @@ semaphore& raft_group0_client::read_apply_mutex() {
     return _read_apply_mutex;
 }
 
+void raft_group0_client::set_cluster_freeze_state(cluster_freeze_state state) {
+    if (_cluster_freeze_state != state) {
+        logger.info("cluster freeze state changed: {} -> {}", _cluster_freeze_state, state);
+        _cluster_freeze_state = state;
+        _cluster_freeze_state_changed.broadcast();
+    }
+}
+
+void raft_group0_client::check_cluster_freeze(cluster_freeze_policy policy) const {
+    switch (_cluster_freeze_state) {
+    case cluster_freeze_state::none:
+        return;
+    case cluster_freeze_state::freezing:
+        if (policy != cluster_freeze_policy::reject_when_freezing) {
+            return;
+        }
+        break;
+    case cluster_freeze_state::frozen:
+        if (policy == cluster_freeze_policy::allow_when_frozen) {
+            return;
+        }
+        break;
+    }
+    throw cluster_frozen_exception(_cluster_freeze_state);
+}
+
+future<> raft_group0_client::wait_until_not_frozen(seastar::abort_source& as) {
+    while (_cluster_freeze_state != cluster_freeze_state::none) {
+        as.check();
+        auto sub = as.subscribe([this] () noexcept { _cluster_freeze_state_changed.broadcast(); });
+        co_await _cluster_freeze_state_changed.wait();
+    }
+}
+
 future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard guard, seastar::abort_source& as,
         std::optional<raft_timeout> timeout)
 {
@@ -168,6 +206,11 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
     }
 
     auto new_group0_state_id = guard.new_group0_state_id();
+
+    // The guard still holds the read_apply mutex, so the freeze state we observe here is the one
+    // corresponding to the observed group 0 state id. If the cluster gets frozen after this check,
+    // the command will fail with group0_concurrent_modification, as the freeze changed the state id.
+    check_cluster_freeze(guard._impl->_freeze_policy);
 
     co_await [&, guard = std::move(guard)] () -> future<> { // lambda is needed to limit guard's lifetime
         raft::command cmd;
@@ -224,10 +267,12 @@ future<> raft_group0_client::add_entry(group0_command group0_cmd, group0_guard g
     throw group0_hard_timeout{};
 }
 
-future<> raft_group0_client::add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as) {
+future<> raft_group0_client::add_entry_unguarded(group0_command group0_cmd, seastar::abort_source* as, cluster_freeze_policy freeze_policy) {
     if (this_shard_id() != 0) {
         on_internal_error(logger, "add_entry_unguarded: must run on shard 0");
     }
+
+    check_cluster_freeze(freeze_policy);
 
     raft::command cmd;
     ser::serialize(cmd, group0_cmd);
@@ -258,7 +303,7 @@ future<utils::UUID> raft_group0_client::get_last_group0_state_id() {
     return _sys_ks.get_last_group0_state_id();
 }
 
-future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout) {
+future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& as, std::optional<raft_timeout> timeout, cluster_freeze_policy freeze_policy) {
     if (this_shard_id() != 0) {
         on_internal_error(logger, "start_group0_operation: must run on shard 0");
     }
@@ -282,7 +327,8 @@ future<group0_guard> raft_group0_client::start_operation(seastar::abort_source& 
             std::move(operation_holder),
             std::move(read_apply_holder),
             observed_group0_state_id,
-            new_group0_state_id
+            new_group0_state_id,
+            freeze_policy
         )
     };
 }
