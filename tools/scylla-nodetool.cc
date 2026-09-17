@@ -612,6 +612,37 @@ void cluster_cleanup_operation(scylla_rest_client& client, const bpo::variables_
     client.post("/storage_service/cleanup_all/", std::move(params));
 }
 
+void cluster_freeze_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    std::unordered_map<sstring, sstring> params;
+    if (vm.contains("timeout")) {
+        params["timeout"] = fmt::to_string(vm["timeout"].as<int64_t>());
+    }
+    client.post("/storage_service/cluster_freeze", std::move(params));
+    fmt::print("The cluster is frozen\n");
+}
+
+void cluster_unfreeze_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    const auto res = client.post("/storage_service/cluster_unfreeze");
+    const auto previous_state = rjson::to_string_view(res["previous_state"]);
+    if (previous_state == "none") {
+        fmt::print("The cluster was not frozen\n");
+        return;
+    }
+    fmt::print("The cluster is unfrozen (it was {})\n", previous_state);
+    if (res["group0_log_advanced"].GetBool()) {
+        fmt::print(std::cerr, "Error: {}. Disk snapshots taken while the cluster was frozen are not guaranteed to be restorable together, take them again\n",
+                previous_state == "frozen"
+                        ? "changes were committed to the group 0 log while the cluster was frozen (e.g. a raft leader change)"
+                        : "the cluster freeze did not complete");
+        throw operation_failed_with_status{1};
+    }
+}
+
+void cluster_freeze_status_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
+    const auto res = client.get("/storage_service/cluster_freeze");
+    fmt::print("{}\n", rjson::to_string_view(res));
+}
+
 void cluster_repair_operation(scylla_rest_client& client, const bpo::variables_map& vm) {
     std::vector<sstring> keyspaces, tables;
     if (vm.contains("keyspace")) {
@@ -4193,6 +4224,56 @@ For more information, see: {}
                             typed_option<std::vector<sstring>>("keyspaces", "The keyspaces to backup"),
                         },
                     },
+                    {
+                        "freeze",
+                        "Freeze cluster-wide changes, to take disk snapshots of all nodes",
+fmt::format(R"(
+Waits for in-progress topology operations (such as tablet migrations and repairs)
+to finish, then rejects all changes to schema, topology, authentication, service
+levels and other cluster-wide state, and stops background operations which change
+it (such as tablet load balancing). Reads and writes of user data are not affected.
+
+Once the command succeeds, disk snapshots of all nodes can be taken and later restored
+together. Unfreeze the cluster with nodetool cluster unfreeze when done.
+
+The freeze fails, leaving the cluster not frozen, if any node is down, if it does not
+complete within the timeout, or if nodetool cluster unfreeze is run in the meantime.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/freeze.html")),
+                        {
+                            typed_option<int64_t>("timeout", "Timeout in seconds, 0 (the default) means no timeout; otherwise at least 300"),
+                        },
+                        {
+                        },
+                    },
+                    {
+                        "unfreeze",
+                        "Unfreeze cluster-wide changes, or abort a freeze in progress",
+fmt::format(R"(
+Exits with a non-zero status if the cluster freeze did not complete, or if changes
+were committed to the group 0 log while the cluster was frozen (for example, due to
+a raft leader change). In both cases, disk snapshots taken while the cluster was
+frozen are not guaranteed to be restorable together.
+
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/freeze.html")),
+                        {
+                        },
+                        {
+                        },
+                    },
+                    {
+                        "freeze-status",
+                        "Print the cluster freeze state: none, freezing or frozen",
+fmt::format(R"(
+For more information, see: {}
+)", doc_link("operating-scylla/nodetool-commands/cluster/freeze.html")),
+                        {
+                        },
+                        {
+                        },
+                    },
                 }
             },
             {
@@ -4208,6 +4289,15 @@ For more information, see: {}
                     },
                     {
                         "backup", { cluster_backup_operation }
+                    },
+                    {
+                        "freeze", { cluster_freeze_operation }
+                    },
+                    {
+                        "unfreeze", { cluster_unfreeze_operation }
+                    },
+                    {
+                        "freeze-status", { cluster_freeze_status_operation }
                     },
                 }
             }
