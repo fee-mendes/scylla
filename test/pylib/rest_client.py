@@ -294,6 +294,16 @@ class ScyllaRESTAPIClient:
     async def quiesce_topology(self, node_ip: str) -> None:
         await self.client.post(f"/storage_service/quiesce_topology", host=node_ip)
 
+    async def cluster_freeze(self, node_ip: str, timeout: Optional[int] = None) -> None:
+        params = {"timeout": str(timeout)} if timeout is not None else None
+        await self.client.post("/storage_service/cluster_freeze", host=node_ip, params=params)
+
+    async def cluster_unfreeze(self, node_ip: str) -> dict:
+        return await self.client.post_json("/storage_service/cluster_unfreeze", host=node_ip)
+
+    async def get_cluster_freeze_state(self, node_ip: str) -> str:
+        return await self.client.get_json("/storage_service/cluster_freeze", host=node_ip)
+
     async def add_tablet_replica(self, node_ip: str, ks: str, table: str, dst_host: HostID, dst_shard: int, token: int, force: bool = False) -> None:
         await self.client.post(f"/storage_service/tablets/add_replica", host=node_ip, params={
             "ks": ks,
