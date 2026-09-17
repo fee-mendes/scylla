@@ -216,6 +216,9 @@ future<> view_building_worker::run_staging_sstables_registrator() {
     while (!_as.abort_requested()) {
         bool sleep = false;
         try {
+            // Group 0 changes are not allowed while the cluster is frozen. The staging sstables
+            // stay queued and are registered once the cluster is unfrozen.
+            co_await _group0.client().wait_until_not_frozen(_as);
             co_await create_staging_sstable_tasks();
             _as.check();
             // create_staging_sstable_tasks() releases _staging_sstables_mutex just before
@@ -238,6 +241,8 @@ future<> view_building_worker::run_staging_sstables_registrator() {
             vbw_logger.warn("Got abort_requested_exception while creating staging sstable tasks");
         } catch (service::group0_concurrent_modification&) {
             vbw_logger.warn("Got group0_concurrent_modification while creating staging sstable tasks");
+        } catch (service::cluster_frozen_exception&) {
+            vbw_logger.info("Cluster got frozen while creating staging sstable tasks, retrying once it is unfrozen");
         } catch (raft::request_aborted&) {
             vbw_logger.warn("Got raft::request_aborted while creating staging sstable tasks");
         } catch (...) {

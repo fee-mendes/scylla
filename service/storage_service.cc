@@ -1108,7 +1108,8 @@ future<> storage_service::sstable_vnodes_cleanup_fiber(raft::server& server, gat
             rtlogger.info("vnodes_cleanup ended");
 
             while (true) {
-                auto guard = co_await _group0->client().start_operation(_group0_as);
+                // A cluster freeze waits for running cleanups to finish, so completing one is allowed while freezing.
+                auto guard = co_await _group0->client().start_operation(_group0_as, std::nullopt, cluster_freeze_policy::allow_when_freezing);
                 topology_mutation_builder builder(guard.write_timestamp());
                 builder.with_node(server.id()).set("cleanup_status", cleanup_status::clean);
 

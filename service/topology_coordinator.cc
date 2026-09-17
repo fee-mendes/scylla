@@ -194,7 +194,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
     future<group0_guard> cleanup_group0_config_if_needed(group0_guard guard) {
         auto& topo = _topo_sm._topology;
         auto rconf = _group0.group0_server().get_configuration();
-        if (!rconf.is_joint()) {
+        // Changing the raft configuration appends to the group 0 log.
+        if (!rconf.is_joint() && topo.freeze_state == cluster_freeze_state::none) {
             // Find nodes that 'left' but still in the config and remove them
             auto to_remove = std::ranges::to<std::vector<raft::server_id>>(
                     rconf.current
@@ -360,9 +361,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         return node_to_work_on{std::move(guard), &topo, e->first, &e->second, std::nullopt, get_request_param(e->first)};
      };
 
-    future<group0_guard> start_operation() {
+    // The topology coordinator finishes in-progress work while the cluster is freezing,
+    // so its changes are allowed in that state by default. See cluster_freeze.hh.
+    future<group0_guard> start_operation(cluster_freeze_policy freeze_policy = cluster_freeze_policy::allow_when_freezing) {
         rtlogger.debug("obtaining group 0 guard...");
-        auto guard = co_await _group0.client().start_operation(_as);
+        auto guard = co_await _group0.client().start_operation(_as, std::nullopt, freeze_policy);
         rtlogger.debug("guard taken, prev_state_id: {}, new_state_id: {}, coordinator term: {}, current Raft term: {}",
                        guard.observed_group0_state_id(), guard.new_group0_state_id(), _term, _raft.get_current_term());
 
@@ -788,6 +791,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
             bool sleep = false;
             try {
+                // Publishing is allowed while freezing: the freeze waits for all generations to be published.
+                co_await await_not_frozen();
                 auto guard = co_await start_operation();
                 utils::chunked_vector<canonical_mutation> updates;
                 sstring reason;
@@ -815,6 +820,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             } catch (seastar::abort_requested_exception&) {
                 rtlogger.debug("CDC generation publisher fiber aborted");
             } catch (group0_concurrent_modification&) {
+            } catch (cluster_frozen_exception&) {
+                rtlogger.debug("CDC generation publisher fiber: cluster is frozen");
             } catch (term_changed_error&) {
                 rtlogger.debug("CDC generation publisher fiber notices term change {} -> {}", _term, _raft.get_current_term());
             } catch (...) {
@@ -837,7 +844,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         while (can_proceed()) {
             bool sleep = true;
             try {
-                auto guard = co_await start_operation();
+                co_await await_not_freezing_or_frozen();
+                auto guard = co_await start_operation(cluster_freeze_policy::reject_when_freezing);
                 utils::chunked_vector<canonical_mutation> updates;
 
                 co_await _cdc_gens.garbage_collect_cdc_streams(updates, guard.write_timestamp());
@@ -852,6 +860,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 sleep = false;
             } catch (seastar::abort_requested_exception&) {
                 rtlogger.debug("CDC streams GC fiber aborted");
+                sleep = false;
+            } catch (cluster_frozen_exception&) {
+                rtlogger.debug("CDC streams GC fiber: cluster is frozen");
                 sleep = false;
             } catch (...) {
                 rtlogger.warn("CDC streams GC fiber got error {:t}", std::current_exception());
@@ -913,7 +924,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         updates.push_back({builder.build()});
                     }
                 });
-                if (!updates.empty()) {
+                if (!updates.empty() && _topo_sm._topology.freeze_state == cluster_freeze_state::none) {
                     co_await update_topology_state(std::move(guard), std::move(updates), reason);
                 }
 
@@ -922,6 +933,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             } catch (seastar::abort_requested_exception&) {
                 rtlogger.debug("gossiper orphan remover fiber aborted");
             } catch (group0_concurrent_modification&) {
+            } catch (cluster_frozen_exception&) {
             } catch (term_changed_error&) {
                 rtlogger.debug("gossiper orphan remover fiber notices term change {} -> {}", _term, _raft.get_current_term());
             } catch (...) {
@@ -958,6 +970,13 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
                 if (!_feature_service.group0_limited_voters) {
                     rtlogger.debug("group0 voters refresh fiber iteration skipped because the feature is disabled");
+                    continue;
+                }
+
+                if (_topo_sm._topology.freeze_state != cluster_freeze_state::none) {
+                    // Changing voters appends a configuration entry to the group 0 log.
+                    // Once the cluster is unfrozen, the topology change event wakes us up again.
+                    rtlogger.debug("group0 voters refresh fiber iteration skipped because the cluster is {}", _topo_sm._topology.freeze_state);
                     continue;
                 }
 
@@ -4581,6 +4600,20 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         co_await _topo_sm.event.when();
     }
 
+    future<> await_not_frozen() {
+        co_await _topo_sm.event.when([this] {
+            return _topo_sm._topology.freeze_state != cluster_freeze_state::frozen || _as.abort_requested();
+        });
+        _as.check();
+    }
+
+    future<> await_not_freezing_or_frozen() {
+        co_await _topo_sm.event.when([this] {
+            return _topo_sm._topology.freeze_state == cluster_freeze_state::none || _as.abort_requested();
+        });
+        _as.check();
+    }
+
     future<> fence_previous_coordinator();
     future<> rollback_current_topology_op(group0_guard&& guard);
 
@@ -4986,12 +5019,22 @@ future<> topology_coordinator::fence_previous_coordinator() {
     // but better to be safe and cut off previous write attempt
     while (!_as.abort_requested()) {
         try {
+            if (_topo_sm._topology.freeze_state == cluster_freeze_state::frozen) {
+                // Nothing can be written while the cluster is frozen. Fencing is not needed either: any guard taken
+                // by a previous coordinator is already invalidated by the change which froze the cluster, and the
+                // next change (completing the freeze or unfreezing) invalidates it again.
+                rtlogger.info("Not fencing the previous topology coordinator since the cluster is frozen");
+                break;
+            }
             auto guard = co_await start_operation();
             topology_mutation_builder builder(guard.write_timestamp());
             co_await update_topology_state(std::move(guard), {builder.build()}, fmt::format("Starting new topology coordinator {}", _group0.group0_server().id()));
             break;
         } catch (group0_concurrent_modification&) {
             // If we failed to write because of concurrent modification lets retry
+            continue;
+        } catch (cluster_frozen_exception&) {
+            // Raced with the cluster getting frozen, see above.
             continue;
         } catch (raft::request_aborted&) {
             // Abort was requested. Break the loop
@@ -5077,6 +5120,8 @@ bool topology_coordinator::handle_topology_coordinator_error(std::exception_ptr 
         rtlogger.warn("topology change coordinator fiber got commit_status_unknown");
     } catch (group0_concurrent_modification&) {
         rtlogger.info("topology change coordinator fiber got group0_concurrent_modification");
+    } catch (cluster_frozen_exception&) {
+        rtlogger.info("topology change coordinator fiber: cluster got frozen");
     } catch (term_changed_error&) {
         // Term changed. We may no longer be a leader
         rtlogger.debug("topology change coordinator fiber notices term change {} -> {}", _term, _raft.get_current_term());

@@ -90,6 +90,8 @@ void view_building_coordinator::handle_coordinator_error(std::exception_ptr eptr
         std::rethrow_exception(eptr);
     } catch (service::group0_concurrent_modification&) {
         vbc_logger.info("view building coordinator got group0_concurrent_modification");
+    } catch (service::cluster_frozen_exception&) {
+        vbc_logger.info("view building coordinator: cluster got frozen, waiting until it is unfrozen");
     } catch (abort_requested_exception&) {
         vbc_logger.debug("view building coordinator got abort_requested_exception");
     } catch (raft::request_aborted&) {
@@ -124,6 +126,11 @@ future<> view_building_coordinator::run() {
         bool sleep = false;
         _remote_work_finished = false;
         try {
+            // No new view building work is scheduled while the cluster is freezing or frozen, since that
+            // requires group 0 changes. Tasks already running on replicas keep running; their results are
+            // picked up once the cluster is unfrozen, and tasks are restarted if the cluster is restored
+            // from disk snapshots.
+            co_await _group0.client().wait_until_not_frozen(_as);
             auto guard_opt = co_await update_state(co_await start_operation());
             if (!guard_opt) {
                 // If `update_state()` returned guard, this means it committed some mutations
@@ -157,12 +164,15 @@ future<> view_building_coordinator::finished_task_gc_fiber() {
 
     while (!_as.abort_requested()) {
         try {
+            co_await _group0.client().wait_until_not_frozen(_as);
             co_await clean_finished_tasks();
             co_await sleep_abortable(task_gc_interval, _as);
         } catch (abort_requested_exception&) {
             vbc_logger.debug("view_building_coordinator::finished_task_gc_fiber got abort_requested_exception");
         } catch (service::group0_concurrent_modification&) {
             vbc_logger.info("view_building_coordinator::finished_task_gc_fiber got group0_concurrent_modification");
+        } catch (service::cluster_frozen_exception&) {
+            vbc_logger.debug("view_building_coordinator::finished_task_gc_fiber: cluster is frozen");
         } catch (raft::request_aborted&) {
             vbc_logger.debug("view_building_coordinator::finished_task_gc_fiber got raft::request_aborted");
         } catch (service::term_changed_error&) {
