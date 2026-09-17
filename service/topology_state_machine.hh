@@ -24,6 +24,7 @@
 #include "replica/database_fwd.hh"
 #include "locator/host_id.hh"
 #include "gms/feature_service.hh"
+#include "service/cluster_freeze.hh"
 
 namespace db {
     class system_keyspace;
@@ -237,6 +238,14 @@ struct topology {
 
     // When false, tablet load balancer will not try to rebalance tablets.
     bool tablet_balancing_enabled = true;
+
+    // See cluster_freeze.hh.
+    cluster_freeze_state freeze_state = cluster_freeze_state::none;
+    // Set when the cluster became frozen: the group 0 state id and the group 0 raft term
+    // at the moment the freeze completed. Used on unfreeze to detect whether anything was
+    // committed to the group 0 log while the cluster was frozen.
+    std::optional<utils::UUID> freeze_group0_state_id;
+    std::optional<int64_t> freeze_group0_term;
 
     // The set of nodes that should be considered dead during topology operations
     std::unordered_set<raft::server_id> ignored_nodes;

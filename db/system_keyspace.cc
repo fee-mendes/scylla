@@ -303,6 +303,9 @@ schema_ptr system_keyspace::topology() {
             .with_column("paused_rf_change_requests", set_type_impl::get_instance(timeuuid_type, true), column_kind::static_column)
             .with_column("ongoing_rf_changes", set_type_impl::get_instance(timeuuid_type, true), column_kind::static_column)
             .with_column("ongoing_restore_requests", set_type_impl::get_instance(timeuuid_type, true), column_kind::static_column)
+            .with_column("cluster_freeze_state", utf8_type, column_kind::static_column)
+            .with_column("cluster_freeze_group0_state_id", timeuuid_type, column_kind::static_column)
+            .with_column("cluster_freeze_group0_term", long_type, column_kind::static_column)
             .set_comment("Current state of topology change machine")
             .with_hash_version()
             .build();
@@ -3375,6 +3378,18 @@ future<service::topology> system_keyspace::load_topology_state(const std::unorde
 
         if (some_row.has("ignore_nodes")) {
             ret.ignored_nodes = decode_nodes_ids(deserialize_set_column(*topology(), some_row, "ignore_nodes"));
+        }
+
+        if (some_row.has("cluster_freeze_state")) {
+            ret.freeze_state = service::cluster_freeze_state_from_string(some_row.get_as<sstring>("cluster_freeze_state"));
+        }
+
+        if (some_row.has("cluster_freeze_group0_state_id")) {
+            ret.freeze_group0_state_id = some_row.get_as<utils::UUID>("cluster_freeze_group0_state_id");
+        }
+
+        if (some_row.has("cluster_freeze_group0_term")) {
+            ret.freeze_group0_term = some_row.get_as<int64_t>("cluster_freeze_group0_term");
         }
 
         ret.excluded_tablet_nodes = ret.ignored_nodes;

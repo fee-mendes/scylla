@@ -113,6 +113,10 @@ public:
     topology_mutation_builder& set_fence_version(topology::version_t);
     topology_mutation_builder& set_session(session_id);
     topology_mutation_builder& set_tablet_balancing_enabled(bool);
+    topology_mutation_builder& set_cluster_freeze_state(cluster_freeze_state);
+    // Records the group 0 state id and raft term at which the cluster became frozen.
+    topology_mutation_builder& set_cluster_freeze_marker(const utils::UUID& group0_state_id, int64_t group0_term);
+    topology_mutation_builder& del_cluster_freeze_marker();
     topology_mutation_builder& set_new_cdc_generation_data_uuid(const utils::UUID& value);
     topology_mutation_builder& set_committed_cdc_generations(const std::vector<cdc::generation_id>& values);
     topology_mutation_builder& set_new_keyspace_rf_change_data(const sstring &ks_name, const std::map<sstring, sstring> &rf_per_dc);
@@ -130,6 +134,8 @@ public:
     topology_mutation_builder& del_global_topology_request_id();
     topology_mutation_builder& queue_global_topology_request_id(const utils::UUID& value);
     topology_mutation_builder& drop_first_global_topology_request_id(const std::vector<utils::UUID>&, const utils::UUID&);
+    // Drops `id` from the queue, wherever it is.
+    topology_mutation_builder& drop_global_topology_request_id(const std::vector<utils::UUID>&, const utils::UUID&);
     // Drops `ids` from the front of the queue. The plural counterpart of the above, for
     // when several queued requests are handled together, see handle_global_request().
     //

@@ -225,6 +225,30 @@ global_topology_request global_topology_request_from_string(const sstring& s) {
     on_internal_error(tsmlogger, format("cannot map name {} to global_topology_request", s));
 }
 
+sstring cluster_freeze_state_to_string(cluster_freeze_state s) {
+    switch (s) {
+    case cluster_freeze_state::none: return "none";
+    case cluster_freeze_state::freezing: return "freezing";
+    case cluster_freeze_state::frozen: return "frozen";
+    }
+    on_internal_error(tsmlogger, format("cannot print cluster freeze state {}", static_cast<uint8_t>(s)));
+}
+
+cluster_freeze_state cluster_freeze_state_from_string(const sstring& s) {
+    for (auto st : {cluster_freeze_state::none, cluster_freeze_state::freezing, cluster_freeze_state::frozen}) {
+        if (cluster_freeze_state_to_string(st) == s) {
+            return st;
+        }
+    }
+    on_internal_error(tsmlogger, format("cannot map name {} to cluster_freeze_state", s));
+}
+
+cluster_frozen_exception::cluster_frozen_exception(cluster_freeze_state state)
+    : exceptions::invalid_request_exception(format(
+            "Cluster is {}: schema, topology, authentication and other cluster-wide changes are not allowed. "
+            "Unfreeze the cluster first (nodetool cluster unfreeze)", state))
+{}
+
 static std::unordered_map<cleanup_status, sstring> cleanup_status_to_name_map = {
     {cleanup_status::clean, "clean"},
     {cleanup_status::needed, "needed"},

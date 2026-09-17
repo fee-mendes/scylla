@@ -212,6 +212,20 @@ topology_mutation_builder& topology_mutation_builder::set_tablet_balancing_enabl
     return *this;
 }
 
+topology_mutation_builder& topology_mutation_builder::set_cluster_freeze_state(cluster_freeze_state value) {
+    return apply_atomic("cluster_freeze_state", cluster_freeze_state_to_string(value));
+}
+
+topology_mutation_builder& topology_mutation_builder::set_cluster_freeze_marker(const utils::UUID& group0_state_id, int64_t group0_term) {
+    apply_atomic("cluster_freeze_group0_state_id", group0_state_id);
+    return apply_atomic("cluster_freeze_group0_term", group0_term);
+}
+
+topology_mutation_builder& topology_mutation_builder::del_cluster_freeze_marker() {
+    del("cluster_freeze_group0_state_id");
+    return del("cluster_freeze_group0_term");
+}
+
 topology_mutation_builder& topology_mutation_builder::del_transition_state() {
     return del("transition_state");
 }
@@ -266,6 +280,14 @@ topology_mutation_builder& topology_mutation_builder::drop_first_global_topology
     } else {
         return *this;
     }
+}
+
+topology_mutation_builder& topology_mutation_builder::drop_global_topology_request_id(const std::vector<utils::UUID>& values, const utils::UUID& id) {
+    if (std::ranges::find(values, id) == values.end()) {
+        return *this;
+    }
+    auto remaining = values | std::views::filter([&id] (const utils::UUID& v) { return v != id; }) | std::ranges::to<std::vector>();
+    return apply_set("global_requests", collection_apply_mode::overwrite, remaining);
 }
 
 topology_mutation_builder& topology_mutation_builder::drop_first_global_topology_request_ids(const std::vector<utils::UUID>& queue,
