@@ -93,6 +93,8 @@ enum class global_topology_request: uint16_t {
     finalize_migration,
     quiesce,
     restore_tablets,
+    // Moves the cluster from cluster_freeze_state::freezing to cluster_freeze_state::frozen.
+    freeze_cluster,
 };
 
 struct ring_slice {

@@ -1352,6 +1352,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             }
         }
         break;
+        case global_topology_request::freeze_cluster:
+            co_await handle_freeze_cluster_request(std::move(guard), req_id);
+            break;
         case global_topology_request::snapshot_tables: {
             rtlogger.info("SNAPSHOT TABLES requested");
             topology_mutation_builder builder(guard.write_timestamp());
@@ -4614,6 +4617,16 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         _as.check();
     }
 
+    // The freeze completed: the cluster is frozen and the marker for detecting later
+    // changes to the group 0 log is recorded. Nothing is left for the coordinator to do.
+    bool is_cluster_frozen() const {
+        return _topo_sm._topology.freeze_state == cluster_freeze_state::frozen && _topo_sm._topology.freeze_group0_state_id;
+    }
+
+    future<> handle_freeze_cluster_request(group0_guard guard, utils::UUID req_id);
+    future<> complete_cluster_freeze(utils::UUID req_id);
+    future<> fail_cluster_freeze(group0_guard guard, utils::UUID req_id, sstring error);
+
     future<> fence_previous_coordinator();
     future<> rollback_current_topology_op(group0_guard&& guard);
 
@@ -5003,6 +5016,127 @@ future<> topology_coordinator::start_tablet_load_stats_refresher() {
     }
 }
 
+// Handles global_topology_request::freeze_cluster, see cluster_freeze.hh.
+//
+// Like every global request, it is handled only when no topology transition is in progress and no
+// node request is pending. While it is queued, the coordinator does not start new work: the tablet
+// load balancer yields to queued global requests (see should_preempt_balancing()), and user-initiated
+// group 0 changes are rejected since the freeze state is `freezing`.
+future<> topology_coordinator::handle_freeze_cluster_request(group0_guard guard, utils::UUID req_id) {
+    const auto& topo = _topo_sm._topology;
+    rtlogger.info("cluster freeze requested (request id {})", req_id);
+
+    if (topo.freeze_state != cluster_freeze_state::freezing) {
+        co_await fail_cluster_freeze(std::move(guard), req_id,
+                fmt::format("the cluster is not being frozen (state: {})", topo.freeze_state));
+        co_return;
+    }
+    if (auto dead = get_dead_nodes(); !dead.empty()) {
+        co_await fail_cluster_freeze(std::move(guard), req_id, fmt::format("nodes are down: {}", dead));
+        co_return;
+    }
+    if (!topo.ignored_nodes.empty()) {
+        co_await fail_cluster_freeze(std::move(guard), req_id, fmt::format("there are ignored nodes: {}", topo.ignored_nodes));
+        co_return;
+    }
+
+    // Wait for in-progress work which changes group 0 on completion. Pending tablet resize decisions
+    // are fine: replicas prepare for them locally, and they are finalized once the cluster is unfrozen.
+    std::optional<sstring> wait_reason;
+    if (!topo.unpublished_cdc_generations.empty()) {
+        wait_reason = "unpublished CDC generations";
+    } else if (std::ranges::any_of(topo.normal_nodes, [] (const auto& n) { return n.second.cleanup == cleanup_status::running; })) {
+        wait_reason = "running vnodes cleanup";
+    } else if (std::ranges::any_of(get_token_metadata_ptr()->tablets().all_tables_ungrouped(), [] (const auto& e) { return e.second->has_transitions(); })) {
+        wait_reason = "tablet transitions";
+    }
+    if (wait_reason) {
+        rtlogger.info("cluster freeze: waiting for {}", *wait_reason);
+        release_guard(std::move(guard));
+        co_await await_event();
+        co_return;
+    }
+
+    topology_mutation_builder builder(guard.write_timestamp());
+    builder.set_cluster_freeze_state(cluster_freeze_state::frozen);
+    co_await update_topology_state(std::move(guard), {builder.build()},
+            fmt::format("cluster freeze: rejecting group 0 changes (request id {})", req_id));
+
+    co_await complete_cluster_freeze(req_id);
+}
+
+// Precondition: the cluster is frozen and the freeze request is still queued.
+future<> topology_coordinator::complete_cluster_freeze(utils::UUID req_id) {
+    co_await utils::get_local_injector().inject("cluster_freeze_pause_before_completion", [this] (auto& handler) -> future<> {
+        rtlogger.info("cluster_freeze_pause_before_completion: waiting");
+        while (!handler.poll_for_message()) {
+            co_await sleep_abortable(std::chrono::milliseconds(100), _as);
+        }
+    });
+
+    std::exception_ptr barrier_error;
+    try {
+        // Make sure every node applied the freeze, and drained operations started with
+        // older topology versions (e.g. streaming for already completed tablet migrations).
+        auto guard = co_await start_operation(cluster_freeze_policy::allow_when_frozen);
+        guard = co_await exec_global_command(std::move(guard), raft_topology_cmd::command::barrier_and_drain, {});
+        release_guard(std::move(guard));
+    } catch (term_changed_error&) {
+        throw;
+    } catch (raft::request_aborted&) {
+        throw;
+    } catch (seastar::abort_requested_exception&) {
+        throw;
+    } catch (...) {
+        barrier_error = std::current_exception();
+    }
+
+    auto guard = co_await start_operation(cluster_freeze_policy::allow_when_frozen);
+    const auto& topo = _topo_sm._topology;
+    if (topo.freeze_state != cluster_freeze_state::frozen
+            || topo.global_requests_queue.empty() || topo.global_requests_queue.front() != req_id) {
+        // Aborted or unfrozen concurrently.
+        rtlogger.info("cluster freeze request {} was aborted concurrently", req_id);
+        co_return;
+    }
+
+    if (barrier_error) {
+        co_await fail_cluster_freeze(std::move(guard), req_id, fmt::format("barrier failed: {}", barrier_error));
+        co_return;
+    }
+
+    // This is the last group 0 change until the cluster is unfrozen. Record its state id and the current
+    // term, so that unfreeze can tell whether anything was committed to the group 0 log in the meantime.
+    auto state_id = guard.new_group0_state_id();
+    auto term = int64_t(_raft.get_current_term().value());
+    topology_mutation_builder builder(guard.write_timestamp());
+    builder.set_cluster_freeze_marker(state_id, term)
+           .drop_first_global_topology_request_id(topo.global_requests_queue, req_id);
+    topology_request_tracking_mutation_builder rtbuilder(req_id);
+    rtbuilder.set("start_time", db_clock::now())
+             .done();
+    co_await update_topology_state(std::move(guard), {builder.build(), rtbuilder.build()},
+            fmt::format("cluster frozen (request id {}, group 0 state id {}, term {})", req_id, state_id, term));
+}
+
+future<> topology_coordinator::fail_cluster_freeze(group0_guard guard, utils::UUID req_id, sstring error) {
+    rtlogger.warn("cluster freeze request {} failed: {}", req_id, error);
+    const auto& topo = _topo_sm._topology;
+    topology_mutation_builder builder(guard.write_timestamp());
+    builder.drop_global_topology_request_id(topo.global_requests_queue, req_id);
+    // Only revert a freeze state which was set by this request. If the request is stale
+    // (the state is already `none`), there is nothing to revert.
+    if (topo.freeze_state != cluster_freeze_state::none) {
+        builder.set_cluster_freeze_state(cluster_freeze_state::none)
+               .del_cluster_freeze_marker();
+    }
+    topology_request_tracking_mutation_builder rtbuilder(req_id);
+    rtbuilder.set("start_time", db_clock::now())
+             .done(error);
+    co_await update_topology_state(std::move(guard), {builder.build(), rtbuilder.build()},
+            fmt::format("cluster freeze failed (request id {}): {}", req_id, error));
+}
+
 future<> topology_coordinator::fence_previous_coordinator() {
     // Write empty change to make sure that a guard taken by any previous coordinator cannot
     // be used to do a successful write any more. Otherwise the following can theoretically happen
@@ -5161,6 +5295,26 @@ future<> topology_coordinator::run() {
 
             if (!event_wait) {
                 event_wait = _topo_sm.event.wait();
+            }
+
+            if (is_cluster_frozen()) {
+                rtlogger.debug("topology coordinator fiber: the cluster is frozen. Sleeping.");
+                _as.check();
+                auto f = std::move(*event_wait);
+                event_wait.reset();
+                co_await std::move(f);
+                continue;
+            }
+
+            if (_topo_sm._topology.freeze_state == cluster_freeze_state::frozen) {
+                // Frozen, but the freeze did not complete yet, e.g. because the previous coordinator
+                // failed in the middle of it.
+                if (auto req_id = _topo_sm._topology.global_requests_queue.empty()
+                        ? std::optional<utils::UUID>() : std::optional(_topo_sm._topology.global_requests_queue.front())) {
+                    co_await complete_cluster_freeze(*req_id);
+                    continue;
+                }
+                on_internal_error(rtlogger, "the cluster is frozen, but neither the freeze marker nor the freeze request is present");
             }
 
             auto guard = co_await cleanup_group0_config_if_needed(co_await start_operation());
